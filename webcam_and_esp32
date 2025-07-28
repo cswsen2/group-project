@@ -1,0 +1,413 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import time
+from threading import Thread
+import queue
+import serial
+import requests
+
+
+class DualCameraCarDetectionSystem:
+    def __init__(self, model_path, camera_index=0, esp32_ip=None, arduino_port=None, baud_rate=9600):
+        """
+        Initialize the dual camera car detection system
+
+        Args:
+            model_path (str): Path to your trained YOLO11s model (best.pt)
+            camera_index (int): Webcam index (usually 0 for default camera)
+            esp32_ip (str): ESP32-CAM IP address
+            arduino_port (str): Arduino serial port
+            baud_rate (int): Serial communication baud rate
+        """
+        self.model = YOLO(model_path)
+
+        # Webcam setup
+        self.camera_index = camera_index
+        self.webcam_cap = None
+        self.webcam_queue = queue.Queue(maxsize=2)
+
+        # ESP32-CAM setup
+        self.esp32_ip = esp32_ip
+        self.esp32_url = f"http://{esp32_ip}" if esp32_ip else None
+        self.esp32_queue = queue.Queue(maxsize=2)
+        self.working_endpoint = None
+
+        # Detection results
+        self.running = False
+        self.webcam_car_count = 0
+        self.esp32_car_count = 0
+        self.total_car_count = 0
+
+        # Arduino serial communication
+        self.arduino_port = arduino_port
+        self.baud_rate = baud_rate
+        self.arduino = None
+
+        if arduino_port:
+            self.initialize_arduino()
+
+    def initialize_webcam(self):
+        """
+        Initialize the webcam
+        """
+        self.webcam_cap = cv2.VideoCapture(self.camera_index)
+        if not self.webcam_cap.isOpened():
+            print(f"✗ Error: Could not open webcam {self.camera_index}")
+            return False
+
+        # Set camera properties for better performance
+        self.webcam_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.webcam_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.webcam_cap.set(cv2.CAP_PROP_FPS, 30)
+
+        print(f"✓ Webcam {self.camera_index} initialized successfully")
+        return True
+
+    def initialize_arduino(self):
+        """
+        Initialize Arduino serial connection
+        """
+        try:
+            self.arduino = serial.Serial(self.arduino_port, self.baud_rate, timeout=1)
+            time.sleep(2)  # Wait for Arduino to initialize
+            print(f"✓ Arduino connected on {self.arduino_port} at {self.baud_rate} baud")
+            return True
+        except serial.SerialException as e:
+            print(f"✗ Failed to connect to Arduino: {e}")
+            return False
+
+    def send_to_arduino(self, total_car_count):
+        """
+        Send total car count to Arduino
+        """
+        if self.arduino and self.arduino.is_open:
+            try:
+                data = f"{total_car_count}\n"
+                self.arduino.write(data.encode())
+                print(f"→ Sent to Arduino: {total_car_count} cars")
+            except serial.SerialException as e:
+                print(f"Error sending data to Arduino: {e}")
+
+    def get_frame_from_webcam(self):
+        """
+        Capture frame from webcam
+        """
+        if self.webcam_cap is None or not self.webcam_cap.isOpened():
+            return None
+
+        ret, frame = self.webcam_cap.read()
+        if ret:
+            return frame
+        else:
+            return None
+
+    def get_frame_from_esp32(self):
+        """
+        Capture frame from ESP32-CAM
+        """
+        if not self.esp32_url:
+            return None
+
+        # Common ESP32-CAM endpoints to try
+        endpoints = ["/cam-hi.jpg", "/cam-lo.jpg", "/cam-mid.jpg", "/capture"]
+
+        # Try working endpoint first if we have one
+        if self.working_endpoint:
+            try:
+                response = requests.get(f"{self.esp32_url}{self.working_endpoint}",
+                                        timeout=3, stream=True)
+                if response.status_code == 200:
+                    img_array = np.frombuffer(response.content, dtype=np.uint8)
+                    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        return frame
+            except:
+                pass
+
+        # Try all endpoints
+        for endpoint in endpoints:
+            try:
+                response = requests.get(f"{self.esp32_url}{endpoint}",
+                                        timeout=3, stream=True)
+                if response.status_code == 200:
+                    img_array = np.frombuffer(response.content, dtype=np.uint8)
+                    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        self.working_endpoint = endpoint
+                        return frame
+            except:
+                continue
+
+        return None
+
+    def webcam_capture_thread(self):
+        """
+        Thread function to continuously capture frames from webcam
+        """
+        while self.running:
+            frame = self.get_frame_from_webcam()
+            if frame is not None:
+                if not self.webcam_queue.full():
+                    self.webcam_queue.put(frame)
+                else:
+                    try:
+                        self.webcam_queue.get_nowait()
+                        self.webcam_queue.put(frame)
+                    except queue.Empty:
+                        pass
+            time.sleep(0.033)  # ~30 FPS
+
+    def esp32_capture_thread(self):
+        """
+        Thread function to continuously capture frames from ESP32-CAM
+        """
+        while self.running:
+            frame = self.get_frame_from_esp32()
+            if frame is not None:
+                if not self.esp32_queue.full():
+                    self.esp32_queue.put(frame)
+                else:
+                    try:
+                        self.esp32_queue.get_nowait()
+                        self.esp32_queue.put(frame)
+                    except queue.Empty:
+                        pass
+            time.sleep(0.1)  # Slower for ESP32-CAM
+
+    def detect_cars(self, frame, camera_name):
+        """
+        Detect cars in the frame using YOLO11s - Simple version like your working code
+
+        Args:
+            frame: Input image frame
+            camera_name: Name of camera for display
+
+        Returns:
+            annotated_frame: Frame with bounding boxes
+            car_count: Number of cars detected
+        """
+        # Run YOLO inference with higher confidence threshold (same as your working code)
+        results = self.model(frame, conf=0.72)  # Only detections above 72% confidence
+
+        # Get the first result
+        result = results[0]
+
+        # Count cars with confidence >= 0.72 (same as your working code)
+        car_count = 0
+        if result.boxes is not None:
+            for box in result.boxes:
+                if box.conf.item() >= 0.72:  # Additional check for confidence
+                    car_count += 1
+
+        # Draw bounding boxes and labels (same as your working code)
+        annotated_frame = result.plot()
+
+        # Add car count text on the frame (same style as your working code)
+        cv2.putText(annotated_frame, f'{camera_name} - Cars (>72%): {car_count}',
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # Add timestamp (same as your working code)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(annotated_frame, timestamp,
+                    (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        return annotated_frame, car_count
+
+    def print_car_count(self, webcam_count, esp32_count, total_count):
+        """
+        Print the car counts (same style as your working code)
+        """
+        print(f"🚗 Webcam: {webcam_count} | ESP32: {esp32_count} | Total: {total_count}")
+
+    def test_connections(self):
+        """
+        Test both camera connections
+        """
+        print("Testing camera connections...")
+
+        webcam_ok = self.initialize_webcam()
+
+        esp32_ok = False
+        if self.esp32_ip:
+            print(f"Testing ESP32-CAM connection at {self.esp32_ip}...")
+            frame = self.get_frame_from_esp32()
+            if frame is not None:
+                print("✓ ESP32-CAM connected successfully")
+                esp32_ok = True
+            else:
+                print("✗ Failed to connect to ESP32-CAM")
+
+        return webcam_ok, esp32_ok
+
+    def run(self):
+        """
+        Main function to run the dual camera detection system
+        """
+        # Test connections first
+        webcam_ok, esp32_ok = self.test_connections()
+
+        if not webcam_ok and not esp32_ok:
+            print("✗ No cameras available!")
+            return
+
+        print("Starting dual camera car detection system...")
+        print("Press 'q' to quit, 's' to save frames")
+
+        self.running = True
+
+        # Start capture threads
+        if webcam_ok:
+            webcam_thread = Thread(target=self.webcam_capture_thread)
+            webcam_thread.daemon = True
+            webcam_thread.start()
+            print("✓ Webcam thread started")
+
+        if esp32_ok:
+            esp32_thread = Thread(target=self.esp32_capture_thread)
+            esp32_thread.daemon = True
+            esp32_thread.start()
+            print("✓ ESP32-CAM thread started")
+
+        # Main processing loop (same structure as your working code)
+        last_update_time = time.time()
+
+        while self.running:
+            try:
+                current_time = time.time()
+
+                # Process webcam frame
+                webcam_frame = None
+                if webcam_ok and not self.webcam_queue.empty():
+                    webcam_frame = self.webcam_queue.get()
+                    webcam_annotated, self.webcam_car_count = self.detect_cars(webcam_frame, "Webcam")
+                    cv2.imshow('Car Detection - Webcam', webcam_annotated)
+
+                # Process ESP32-CAM frame
+                esp32_frame = None
+                if esp32_ok and not self.esp32_queue.empty():
+                    esp32_frame = self.esp32_queue.get()
+                    esp32_annotated, self.esp32_car_count = self.detect_cars(esp32_frame, "ESP32-CAM")
+                    cv2.imshow('Car Detection - ESP32-CAM', esp32_annotated)
+
+                # Update total count and send to Arduino every second
+                if current_time - last_update_time >= 1.0:
+                    self.total_car_count = self.webcam_car_count + self.esp32_car_count
+
+                    # Print car counts (same as your working code)
+                    self.print_car_count(self.webcam_car_count, self.esp32_car_count, self.total_car_count)
+
+                    # Send to Arduino
+                    if self.arduino:
+                        self.send_to_arduino(self.total_car_count)
+
+                    last_update_time = current_time
+
+                # Handle key presses (same as your working code)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('s'):
+                    # Save both frames (same as your working code)
+                    timestamp = int(time.time())
+                    if webcam_frame is not None:
+                        filename = f"webcam_detection_{timestamp}.jpg"
+                        cv2.imwrite(filename, webcam_annotated)
+                        print(f"Webcam frame saved as {filename}")
+                    if esp32_frame is not None:
+                        filename = f"esp32_detection_{timestamp}.jpg"
+                        cv2.imwrite(filename, esp32_annotated)
+                        print(f"ESP32 frame saved as {filename}")
+
+            except KeyboardInterrupt:
+                break
+
+        # Cleanup (same as your working code)
+        self.running = False
+        if self.webcam_cap is not None:
+            self.webcam_cap.release()
+        if self.arduino and self.arduino.is_open:
+            self.arduino.close()
+            print("Arduino connection closed")
+        cv2.destroyAllWindows()
+        print("Dual camera detection system stopped")
+
+
+def main():
+    # Configuration
+    MODEL_PATH = "best.pt"  # Your model file
+    CAMERA_INDEX = 0  # Webcam index
+    ESP32_IP = "10.61.31.144"  # Your ESP32-CAM IP
+
+    # Arduino Configuration (optional)
+    ARDUINO_PORT = "COM3"  # Change to your Arduino port or set to None to disable
+    BAUD_RATE = 9600
+
+    # Create and run the dual detection system
+    detector = DualCameraCarDetectionSystem(
+        model_path=MODEL_PATH,
+        camera_index=CAMERA_INDEX,
+        esp32_ip=ESP32_IP,
+        arduino_port=ARDUINO_PORT,
+        baud_rate=BAUD_RATE
+    )
+    detector.run()
+
+
+if __name__ == "__main__":
+    main()
+
+
+# Additional utility functions (same as your working code)
+
+def list_available_cameras():
+    """
+    Utility function to find available camera indices
+    """
+    print("Scanning for available cameras...")
+    available_cameras = []
+
+    for i in range(5):  # Check first 5 camera indices
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret:
+                print(f"✓ Camera {i}: Available")
+                available_cameras.append(i)
+            else:
+                print(f"✗ Camera {i}: Cannot capture")
+            cap.release()
+        else:
+            print(f"✗ Camera {i}: Not available")
+
+    if available_cameras:
+        print(f"\nAvailable cameras: {available_cameras}")
+        print(f"Use CAMERA_INDEX = {available_cameras[0]} in your code")
+    else:
+        print("\nNo cameras found!")
+
+    return available_cameras
+
+
+def test_esp32_connection(esp32_ip):
+    """
+    Test ESP32-CAM connection
+    """
+    print(f"Testing ESP32-CAM at {esp32_ip}...")
+    endpoints = ["/cam-hi.jpg", "/cam-lo.jpg", "/cam-mid.jpg", "/capture"]
+
+    for endpoint in endpoints:
+        try:
+            response = requests.get(f"http://{esp32_ip}{endpoint}", timeout=5)
+            if response.status_code == 200:
+                print(f"✓ ESP32-CAM working at {esp32_ip}{endpoint}")
+                return True
+        except:
+            continue
+
+    print(f"✗ ESP32-CAM not responding at {esp32_ip}")
+    return False
+
+# Usage examples:
+# list_available_cameras()  # Find available webcams
+# test_esp32_connection("192.168.1.100")  # Test ESP32-CAM connection
