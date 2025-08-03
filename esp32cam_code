@@ -286,4 +286,5 @@ def find_esp32_ip():
     return None
 
 # Usage example:
+
 # python car_detection.py
