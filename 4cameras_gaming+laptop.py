@@ -4,12 +4,11 @@ from ultralytics import YOLO
 import requests
 import time
 import threading
-import queue
 from datetime import datetime
 import os
 
 
-class MultiESP32CameraSystem:
+class OptimizedGaming4CameraSystem:
     def __init__(self):
         # Camera configurations
         self.cameras = {
@@ -19,13 +18,16 @@ class MultiESP32CameraSystem:
             "Camera_4": {"ip": "192.168.1.103", "position": "Main Entrance"}
         }
 
-        # YOLO model - load once, use for all cameras
-        print("Loading YOLO model...")
+        # Single YOLO model - GPU will share efficiently
+        print("Loading YOLO model for gaming laptop...")
         self.model = YOLO("best.pt")
 
-        # Force GPU usage if available
-        device = 'cuda' if self.model.device.type == 'cuda' else 'cpu'
-        print(f"Using device: {device}")
+        # Verify GPU usage
+        device = next(self.model.model.parameters()).device
+        print(f"✅ Model running on: {device}")
+
+        if device.type != 'cuda':
+            print("⚠️  Warning: Not using GPU. Install CUDA-enabled PyTorch for best performance")
 
         # Class information
         self.class_info = {
@@ -34,132 +36,112 @@ class MultiESP32CameraSystem:
             2: ('pedestrian', (255, 0, 0))
         }
 
-        # Frame queues for each camera
-        self.frame_queues = {cam: queue.Queue(maxsize=3) for cam in self.cameras}
-        self.result_queues = {cam: queue.Queue(maxsize=3) for cam in self.cameras}
-
-        # Control flags
+        # Control flag
         self.running = True
+
+        # Performance tracking
+        self.stats = {
+            cam: {
+                "fps": 0,
+                "frames": 0,
+                "processing_times": [],
+                "network_times": [],
+                "start_time": time.time()
+            } for cam in self.cameras
+        }
+
+        # Optimized sessions per camera
         self.sessions = {}
-
-        # Statistics
-        self.stats = {cam: {"fps": 0, "frames": 0, "errors": 0} for cam in self.cameras}
-
-        # Create sessions for each camera
         for cam_name in self.cameras:
-            self.sessions[cam_name] = requests.Session()
-            self.sessions[cam_name].headers.update({'Connection': 'keep-alive'})
+            session = requests.Session()
+            # Optimize for high-performance networking
+            session.headers.update({
+                'Connection': 'keep-alive',
+                'Keep-Alive': 'timeout=5, max=100'
+            })
+            self.sessions[cam_name] = session
 
-    def capture_frames(self, camera_name):
-        """Capture frames from a specific ESP32-CAM"""
+    def camera_worker(self, camera_name):
+        """
+        Simplified worker: Capture → Process → Display
+        No queues needed for high-end hardware
+        """
         camera_info = self.cameras[camera_name]
         url = f"http://{camera_info['ip']}/cam-mid.jpg"
         session = self.sessions[camera_name]
 
-        frame_count = 0
-        start_time = time.time()
+        # Create dedicated window
+        window_name = f"{camera_name} - {camera_info['position']}"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 640, 480)
 
-        print(f"🎥 Started capturing from {camera_name} ({camera_info['position']})")
+        print(f"🎥 Started {camera_name} ({camera_info['position']})")
+
+        frame_count = 0
 
         while self.running:
             try:
+                # Network timing
+                net_start = time.time()
                 response = session.get(url, timeout=2.0)
                 response.raise_for_status()
 
                 img_array = np.frombuffer(response.content, dtype=np.uint8)
                 frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                net_time = time.time() - net_start
 
-                if frame is not None:
-                    # Add camera info to frame
-                    frame_with_info = {
-                        'frame': frame,
-                        'camera': camera_name,
-                        'position': camera_info['position'],
-                        'timestamp': datetime.now()
-                    }
+                if frame is None:
+                    continue
 
-                    # Put frame in queue (non-blocking)
-                    try:
-                        self.frame_queues[camera_name].put(frame_with_info, block=False)
-                        frame_count += 1
-                    except queue.Full:
-                        # Remove old frame and add new one
-                        try:
-                            self.frame_queues[camera_name].get_nowait()
-                            self.frame_queues[camera_name].put(frame_with_info, block=False)
-                        except queue.Empty:
-                            pass
+                # YOLO processing timing
+                process_start = time.time()
+                results = self.model(frame, conf=0.5, verbose=False)
+                process_time = time.time() - process_start
 
-                # Update FPS stats
+                # Draw detections efficiently
+                annotated_frame = self.draw_detections(
+                    frame, results[0], camera_name, camera_info['position'],
+                    net_time, process_time
+                )
+
+                # Display immediately (no queue delay)
+                cv2.imshow(window_name, annotated_frame)
+
+                # Update statistics
+                frame_count += 1
+                self.stats[camera_name]["frames"] = frame_count
+                self.stats[camera_name]["processing_times"].append(process_time)
+                self.stats[camera_name]["network_times"].append(net_time)
+
+                # Calculate FPS every 30 frames
                 if frame_count % 30 == 0:
-                    elapsed = time.time() - start_time
+                    elapsed = time.time() - self.stats[camera_name]["start_time"]
                     self.stats[camera_name]["fps"] = frame_count / elapsed
-                    self.stats[camera_name]["frames"] = frame_count
+
+                # Handle input (any camera can trigger quit)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    self.running = False
+                    break
 
             except Exception as e:
-                self.stats[camera_name]["errors"] += 1
-                if self.stats[camera_name]["errors"] % 10 == 1:  # Print every 10th error
-                    print(f"❌ {camera_name} error: {e}")
-                time.sleep(0.1)  # Brief pause on error
+                print(f"❌ {camera_name} error: {e}")
+                time.sleep(0.1)
 
-            time.sleep(0.033)  # ~30 FPS max attempt rate
+        cv2.destroyWindow(window_name)
+        session.close()
+        print(f"🛑 {camera_name} stopped")
 
-    def process_frames(self):
-        """Process frames from all cameras using YOLO"""
-        print("🧠 Started YOLO processing thread")
-
-        while self.running:
-            # Process frames from all cameras
-            for camera_name in self.cameras:
-                try:
-                    # Get frame from queue
-                    frame_data = self.frame_queues[camera_name].get(timeout=0.1)
-
-                    # Run YOLO detection
-                    results = self.model(frame_data['frame'], conf=0.5, verbose=False)
-
-                    # Process detections
-                    processed_frame = self.draw_detections(
-                        frame_data['frame'].copy(),
-                        results[0],
-                        frame_data['camera'],
-                        frame_data['position']
-                    )
-
-                    # Put processed frame in result queue
-                    result_data = {
-                        'frame': processed_frame,
-                        'camera': frame_data['camera'],
-                        'position': frame_data['position'],
-                        'timestamp': frame_data['timestamp']
-                    }
-
-                    try:
-                        self.result_queues[camera_name].put(result_data, block=False)
-                    except queue.Full:
-                        try:
-                            self.result_queues[camera_name].get_nowait()
-                            self.result_queues[camera_name].put(result_data, block=False)
-                        except queue.Empty:
-                            pass
-
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    print(f"Processing error for {camera_name}: {e}")
-
-    def draw_detections(self, frame, results, camera_name, position):
-        """Draw YOLO detections on frame"""
+    def draw_detections(self, frame, results, camera_name, position, net_time, process_time):
+        """Optimized detection drawing for gaming laptop"""
         counts = [0, 0, 0]  # car, non-car, pedestrian
 
         # Process detections
         if results.boxes is not None:
-            boxes = results.boxes
-            for i in range(len(boxes)):
-                confidence = boxes.conf[i].item()
+            for i, box in enumerate(results.boxes):
+                confidence = box.conf.item()
                 if confidence > 0.5:
-                    x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().astype(int)
-                    class_id = int(boxes.cls[i].item())
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    class_id = int(box.cls.item())
 
                     if class_id in self.class_info:
                         class_name, color = self.class_info[class_id]
@@ -171,18 +153,17 @@ class MultiESP32CameraSystem:
                                     (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
                                     0.5, color, 1)
 
-        # Add camera info overlay
-        overlay_height = 120
-        overlay = np.zeros((overlay_height, frame.shape[1], 3), dtype=np.uint8)
-        overlay[:] = (0, 0, 0)  # Black background
+        # Gaming laptop info overlay
+        info_height = 140
+        overlay = np.zeros((info_height, frame.shape[1], 3), dtype=np.uint8)
 
-        # Camera info
+        # Camera identification
         cv2.putText(overlay, f'Camera: {camera_name}', (10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.putText(overlay, f'Location: {position}', (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        # Detection counts
+        # Detection counts with colors
         cv2.putText(overlay, f'Cars: {counts[0]}', (10, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         cv2.putText(overlay, f'Non-cars: {counts[1]}', (120, 65),
@@ -190,133 +171,111 @@ class MultiESP32CameraSystem:
         cv2.putText(overlay, f'Pedestrians: {counts[2]}', (250, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-        # FPS info
+        # Performance metrics (gaming laptop specific)
         fps = self.stats[camera_name]["fps"]
         cv2.putText(overlay, f'FPS: {fps:.1f}', (10, 85),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(overlay, f'GPU: {process_time * 1000:.0f}ms', (120, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(overlay, f'Network: {net_time * 1000:.0f}ms', (220, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+
+        # Hardware utilization indicator
+        if process_time < 0.05:  # Less than 50ms = GPU working well
+            gpu_status = "GPU: Optimal"
+            gpu_color = (0, 255, 0)
+        elif process_time < 0.1:
+            gpu_status = "GPU: Good"
+            gpu_color = (0, 255, 255)
+        else:
+            gpu_status = "GPU: Check CUDA"
+            gpu_color = (0, 0, 255)
+
+        cv2.putText(overlay, gpu_status, (10, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, gpu_color, 1)
 
         # Timestamp
         timestamp = datetime.now().strftime("%H:%M:%S")
-        cv2.putText(overlay, timestamp, (10, 105),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(overlay, timestamp, (10, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-        # Combine overlay with frame
-        combined = np.vstack([overlay, frame])
-        return combined
+        return np.vstack([overlay, frame])
 
-    def display_cameras(self):
-        """Display all camera feeds in a grid"""
-        print("🖥️  Started display thread")
+    def print_performance_stats(self):
+        """Print detailed performance statistics for gaming laptop"""
+        print("\n📊 Gaming Laptop Performance Stats:")
+        print("=" * 60)
 
-        # Create windows
-        window_names = []
-        for camera_name in self.cameras:
-            window_name = f"{camera_name} - {self.cameras[camera_name]['position']}"
-            window_names.append(window_name)
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window_name, 640, 480)
-
-        # Position windows in grid
-        positions = [(0, 0), (650, 0), (0, 500), (650, 500)]
-        for i, window_name in enumerate(window_names):
-            if i < len(positions):
-                cv2.moveWindow(window_name, positions[i][0], positions[i][1])
-
-        while self.running:
-            display_count = 0
-
-            # Display each camera
-            for i, camera_name in enumerate(self.cameras):
-                try:
-                    result_data = self.result_queues[camera_name].get(timeout=0.1)
-                    cv2.imshow(window_names[i], result_data['frame'])
-                    display_count += 1
-                except queue.Empty:
-                    continue
-
-            # Handle key press
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                self.running = False
-                break
-            elif key == ord('s'):
-                self.save_all_frames()
-            elif key == ord('p'):
-                self.print_stats()
-
-        cv2.destroyAllWindows()
-
-    def save_all_frames(self):
-        """Save current frame from all cameras"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = f"saved_frames_{timestamp}"
-        os.makedirs(save_dir, exist_ok=True)
-
-        for camera_name in self.cameras:
-            try:
-                result_data = self.result_queues[camera_name].get_nowait()
-                filename = f"{save_dir}/{camera_name}_{timestamp}.jpg"
-                cv2.imwrite(filename, result_data['frame'])
-                print(f"💾 Saved {filename}")
-            except queue.Empty:
-                print(f"No frame available for {camera_name}")
-
-    def print_stats(self):
-        """Print performance statistics"""
-        print("\n📊 System Statistics:")
-        print("=" * 50)
         for camera_name, stats in self.stats.items():
             position = self.cameras[camera_name]['position']
-            print(f"{camera_name} ({position}):")
-            print(f"  FPS: {stats['fps']:.1f} | Frames: {stats['frames']} | Errors: {stats['errors']}")
+
+            if stats['processing_times'] and stats['network_times']:
+                avg_process = np.mean(stats['processing_times'][-30:]) * 1000  # Last 30 frames
+                avg_network = np.mean(stats['network_times'][-30:]) * 1000
+
+                print(f"{camera_name} ({position}):")
+                print(f"  FPS: {stats['fps']:.1f} | Frames: {stats['frames']}")
+                print(f"  GPU Processing: {avg_process:.0f}ms | Network: {avg_network:.0f}ms")
+
+                # Performance analysis
+                if avg_process < 30:
+                    print(f"  ✅ GPU Performance: Excellent")
+                elif avg_process < 60:
+                    print(f"  ⚡ GPU Performance: Good")
+                else:
+                    print(f"  ⚠️  GPU Performance: Check CUDA installation")
 
     def run(self):
-        """Main function to run the multi-camera system"""
-        print("🚀 Starting 4x ESP32-CAM Detection System")
-        print("📱 Camera Configuration:")
+        """Run the optimized 4-camera system"""
+        print("🚀 Starting Gaming Laptop 4-Camera System")
+        print("🎮 Hardware: i7 13th Gen + RTX 3070")
+        print("⚡ Optimized: No queues, direct GPU processing")
+        print("📱 Cameras:")
         for name, info in self.cameras.items():
             print(f"   {name}: {info['ip']} ({info['position']})")
-        print("\nControls:")
-        print("   'q' - Quit")
-        print("   's' - Save all current frames")
-        print("   'p' - Print performance stats")
+
+        print("\n🎮 Gaming Laptop Controls:")
+        print("   'q' - Quit (from any camera window)")
+        print("   Windows will arrange automatically")
         print("=" * 50)
 
-        # Start capture threads for each camera
-        capture_threads = []
-        for camera_name in self.cameras:
-            thread = threading.Thread(target=self.capture_frames, args=(camera_name,))
+        # Position windows for gaming laptop (wider screen assumed)
+        positions = [(0, 0), (660, 0), (1320, 0), (0, 650)]
+
+        # Start all camera threads
+        threads = []
+        for i, camera_name in enumerate(self.cameras):
+            thread = threading.Thread(target=self.camera_worker, args=(camera_name,))
             thread.daemon = True
             thread.start()
-            capture_threads.append(thread)
+            threads.append(thread)
 
-        # Start processing thread
-        process_thread = threading.Thread(target=self.process_frames)
-        process_thread.daemon = True
-        process_thread.start()
+            # Brief delay to stagger window creation
+            time.sleep(0.5)
 
-        # Start display thread (main thread)
         try:
-            self.display_cameras()
+            # Monitor system performance
+            while self.running:
+                time.sleep(10)  # Print stats every 10 seconds
+                self.print_performance_stats()
+
         except KeyboardInterrupt:
-            pass
-        finally:
             self.running = False
-            print("🛑 Shutting down...")
 
-            # Close sessions
-            for session in self.sessions.values():
-                session.close()
+        print("\n🛑 Shutting down gaming system...")
 
-            print("✅ Multi-camera system stopped")
+        # Wait for threads to finish
+        for thread in threads:
+            thread.join(timeout=2)
+
+        print("✅ Gaming laptop 4-camera system stopped")
 
 
 def main():
-    # Create and run the multi-camera system
-    system = MultiESP32CameraSystem()
+    system = OptimizedGaming4CameraSystem()
 
-    # Update these IP addresses to match your ESP32-CAMs
-    print("⚠️  Don't forget to update camera IP addresses in the code!")
+    print("⚠️  Update camera IP addresses in the code!")
+    print("⚠️  Ensure CUDA-enabled PyTorch is installed for GPU acceleration")
 
     system.run()
 
