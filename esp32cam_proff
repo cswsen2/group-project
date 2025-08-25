@@ -7,8 +7,8 @@ import os
 from datetime import datetime
 
 MODEL_PATH = "best.pt"
-ESP32_IP = "10.25.250.144"
-ESP32_URL = f"http://{ESP32_IP}/cam-mid.jpg"
+ESP32_IP = "10.103.138.144"
+ESP32_URL = f"http://{ESP32_IP}/cam-lo.jpg"
 
 model = YOLO(MODEL_PATH)
 
@@ -52,14 +52,14 @@ while True:
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, f'{class_name}: {confidence:.2f}',
-                                (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                                (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 0)
 
         cv2.putText(frame, f'Cars: {counts["car"]}', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 0)
         cv2.putText(frame, f'Non-cars: {counts["non-car"]}', (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 0)
         cv2.putText(frame, f'Pedestrians: {counts["pedestrian"]}', (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 0)
 
         cv2.imshow('ESP32-CAM Live Detection', frame)
 
