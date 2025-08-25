@@ -1,0 +1,239 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import requests
+import time
+import os
+import threading
+from datetime import datetime
+
+# Configuration
+MODEL_PATH = "best.pt"
+ESP32_IPS = [
+    "10.103.138.144",
+    "10.103.138.144",
+    "10.103.138.144",
+    "10.103.138.144"
+]
+
+# Class names and colors
+class_names = {0: 'car', 1: 'non-car', 2: 'pedestrian'}
+class_colors = {0: (0, 255, 0), 1: (0, 0, 255), 2: (255, 0, 0)}
+
+# Global control
+running = True
+
+
+class CameraThread:
+    def __init__(self, camera_id, ip_address):
+        self.camera_id = camera_id
+        self.ip_address = ip_address
+        self.url = f"http://{ip_address}/cam-lo.jpg"  # Use faster endpoint
+        self.session = requests.Session()
+        self.model = None
+        self.current_frame = None
+        self.is_active = False
+        self.failed_attempts = 0
+        self.max_attempts = 5  # Reduce attempts to fail faster
+
+        # FPS calculation
+        self.frame_count = 0
+        self.start_time = time.time()
+        self.fps = 0
+
+        # Create save directory
+        self.save_dir = f"saved_images/camera_{camera_id}"
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)
+
+    def test_connection(self):
+        """Test if camera is accessible"""
+        try:
+            print(f"Testing camera {self.camera_id} ({self.ip_address})...")
+            response = self.session.get(self.url, timeout=3)  # Longer timeout for test
+            if response.status_code == 200 and len(response.content) > 500:  # Lower threshold
+                print(f"Camera {self.camera_id} connected successfully!")
+                return True
+            else:
+                print(f"Camera {self.camera_id} - Invalid response (size: {len(response.content)})")
+                return False
+        except Exception as e:
+            print(f"Camera {self.camera_id} - Connection failed: {e}")
+            return False
+
+    def run(self):
+        """Main thread function"""
+        print(f"Starting camera {self.camera_id} thread for IP: {self.ip_address}")
+
+        # Initial connection test with retries
+        for attempt in range(3):
+            if self.test_connection():
+                break
+            print(f"Camera {self.camera_id} - Attempt {attempt + 1} failed, retrying...")
+            time.sleep(3)
+        else:
+            print(f"Camera {self.camera_id} - All connection attempts failed. Stopping thread.")
+            return
+
+        # Load AI model only if camera is connected
+        if self.failed_attempts < self.max_attempts:
+            print(f"Loading AI model for camera {self.camera_id}...")
+            self.model = YOLO(MODEL_PATH)
+            self.is_active = True
+            print(f"Camera {self.camera_id} ready!")
+
+        while running and self.is_active and self.failed_attempts < self.max_attempts:
+            try:
+                # Get frame from ESP32-CAM
+                response = self.session.get(self.url, timeout=15)  # Much longer timeout
+
+                if response.status_code != 200:
+                    print(f"Camera {self.camera_id} - HTTP error: {response.status_code}")
+                    self.failed_attempts += 1
+                    time.sleep(2)
+                    continue
+
+                img_array = np.frombuffer(response.content, dtype=np.uint8)
+                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+                if frame is None:
+                    print(f"Camera {self.camera_id} - Failed to decode frame")
+                    self.failed_attempts += 1
+                    time.sleep(2)
+                    continue
+
+                # Reset failed attempts on successful frame
+                self.failed_attempts = 0
+
+                # Calculate FPS
+                self.frame_count += 1
+                if self.frame_count % 10 == 0:  # Update FPS every 10 frames
+                    elapsed = time.time() - self.start_time
+                    self.fps = self.frame_count / elapsed
+                    if elapsed > 30:  # Reset counter every 30 seconds
+                        self.frame_count = 0
+                        self.start_time = time.time()
+
+                # Store current frame for saving
+                self.current_frame = frame.copy()
+
+                # Run AI detection
+                results = self.model(frame, conf=0.5)
+
+                # Count objects
+                counts = {'car': 0, 'non-car': 0, 'pedestrian': 0}
+
+                # Draw detections
+                if results[0].boxes is not None:
+                    for box in results[0].boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        class_id = int(box.cls.item())
+                        confidence = box.conf.item()
+
+                        if confidence > 0.5:
+                            class_name = class_names[class_id]
+                            color = class_colors[class_id]
+                            counts[class_name] += 1
+
+                            # Draw box and label
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(frame, f'{class_name}: {confidence:.2f}',
+                                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+                # Show counts and FPS
+                cv2.putText(frame, f'C:{counts["car"]} NC:{counts["non-car"]} P:{counts["pedestrian"]}',
+                            (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(frame, f'FPS: {self.fps:.1f}',
+                            (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+                # Add camera info
+                cv2.putText(frame, f'Cam{self.camera_id} - {self.ip_address}',
+                            (5, frame.shape[0] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+
+                # Show video - this must be in main thread for OpenCV
+                cv2.imshow(f'ESP32-CAM {self.camera_id}', frame)
+                cv2.waitKey(1)  # Important: process OpenCV events
+
+                # Print detection results
+                total = sum(counts.values())
+                if total > 0:
+                    print(
+                        f"Camera {self.camera_id}: Cars:{counts['car']}, Non-cars:{counts['non-car']}, Pedestrians:{counts['pedestrian']}")
+
+            except Exception as e:
+                print(f"Camera {self.camera_id} error: {e}")
+                self.failed_attempts += 1
+                time.sleep(2)
+
+        # Thread ending
+        if self.failed_attempts >= self.max_attempts:
+            print(f"Camera {self.camera_id} - Stopped after too many failures")
+        else:
+            print(f"Camera {self.camera_id} - Thread ended")
+
+    def save_frame(self):
+        """Save current frame"""
+        if self.current_frame is not None and self.is_active:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{self.save_dir}/detection_cam{self.camera_id}_{timestamp}.jpg"
+            cv2.imwrite(filename, self.current_frame)
+            print(f"Camera {self.camera_id}: Saved {filename}")
+            return True
+        return False
+
+
+def main():
+    global running
+
+    print("Starting Multi-Camera ESP32-CAM Detection System...")
+    print("Press 'q' to quit, 's' to save all frames")
+    print()
+
+    # Create and start camera threads
+    cameras = []
+    threads = []
+
+    for i, ip in enumerate(ESP32_IPS):
+        camera = CameraThread(i, ip)
+        cameras.append(camera)
+
+        thread = threading.Thread(target=camera.run, daemon=True)
+        thread.start()
+        threads.append(thread)
+
+    # Give threads time to initialize
+    time.sleep(3)
+
+    try:
+        while True:
+            key = cv2.waitKey(30) & 0xFF  # Slower polling
+
+            if key == ord('q'):
+                print("Shutting down...")
+                break
+            elif key == ord('s'):
+                # Save all frames
+                saved = 0
+                for camera in cameras:
+                    if camera.save_frame():
+                        saved += 1
+                print(f"Saved frames from {saved} active cameras")
+
+            # Check if any cameras are still active
+            active_cameras = sum(1 for cam in cameras if cam.is_active)
+            if active_cameras == 0:
+                print("No active cameras. Exiting...")
+                break
+
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt")
+
+    finally:
+        running = False
+        time.sleep(2)
+        cv2.destroyAllWindows()
+        print("System stopped")
+
+
+if __name__ == "__main__":
+    main()
