@@ -1,0 +1,294 @@
+#include <ArduinoJson.h>
+
+// Traffic Light Pin Definitions
+// Lane 0 (North) - Pins 2,3,4
+// Lane 1 (South) - Pins 5,6,7  
+// Lane 2 (East) - Pins 8,9,10
+// Lane 3 (West) - Pins 11,12,13
+
+const int RED_PINS[] = {2, 5, 8, 11};
+const int YELLOW_PINS[] = {3, 6, 9, 12};
+const int GREEN_PINS[] = {4, 7, 10, 13};
+
+// Timing constants (milliseconds)
+const unsigned long GREEN_TIME_BASE = 10000;  // 10 seconds base
+const unsigned long GREEN_TIME_MAX = 30000;   // 30 seconds maximum  
+const unsigned long YELLOW_TIME = 3000;       // 3 seconds
+const unsigned long RED_CLEARANCE = 2000;     // 2 seconds all red
+const unsigned long EMERGENCY_GREEN = 20000;  // 20 seconds for emergency
+
+// System state
+int current_lane = 0;
+int target_lane = 0;
+unsigned long state_start_time = 0;
+unsigned long green_duration = GREEN_TIME_BASE;
+bool emergency_mode = false;
+bool transition_in_progress = false;
+
+enum TrafficState {
+  ALL_RED_START,
+  GREEN_ACTIVE, 
+  YELLOW_ACTIVE,
+  ALL_RED_CLEAR
+};
+
+TrafficState current_state = ALL_RED_START;
+
+// Data from Python
+struct LaneData {
+  int car_count;
+  int emergency_count;
+  int heavy_count;
+  int pedestrian_count;
+  int public_count;
+  int total_vehicles;
+  int priority_score;
+};
+
+LaneData lane_data[4];
+int priority_lane = 0;
+unsigned long last_data_time = 0;
+const unsigned long DATA_TIMEOUT = 10000; // 10 seconds timeout
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Initialize all traffic light pins
+  for (int i = 0; i < 4; i++) {
+    pinMode(RED_PINS[i], OUTPUT);
+    pinMode(YELLOW_PINS[i], OUTPUT);
+    pinMode(GREEN_PINS[i], OUTPUT);
+  }
+  
+  // Start with all red lights
+  setAllRed();
+  state_start_time = millis();
+  
+  Serial.println("Traffic Light Controller Ready");
+  Serial.println("Lane Layout: 0=North, 1=South, 2=East, 3=West");
+}
+
+void loop() {
+  // Read data from Python script
+  readPythonData();
+  
+  // Check for data timeout
+  if (millis() - last_data_time > DATA_TIMEOUT) {
+    // Default cycling if no data
+    defaultTrafficCycle();
+  } else {
+    // AI-controlled traffic management
+    aiTrafficControl();
+  }
+  
+  delay(100); // Small delay for stability
+}
+
+void readPythonData() {
+  if (Serial.available() > 0) {
+    String json_string = Serial.readStringUntil('\n');
+    
+    // Parse JSON data
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, json_string);
+    
+    if (error) {
+      Serial.print("JSON parse error: ");
+      Serial.println(error.c_str());
+      return;
+    }
+    
+    // Extract priority lane
+    priority_lane = doc["priority_lane"];
+    
+    // Extract lane data
+    JsonObject lanes = doc["lanes"];
+    for (int i = 0; i < 4; i++) {
+      String lane_key = String(i);
+      if (lanes.containsKey(lane_key)) {
+        JsonObject lane = lanes[lane_key];
+        
+        lane_data[i].car_count = lane["car"] | 0;
+        lane_data[i].emergency_count = lane["emergency"] | 0;
+        lane_data[i].heavy_count = lane["heavy"] | 0;
+        lane_data[i].pedestrian_count = lane["pedestrian"] | 0;
+        lane_data[i].public_count = lane["public"] | 0;
+        
+        // Calculate totals
+        lane_data[i].total_vehicles = lane_data[i].car_count + 
+                                     lane_data[i].heavy_count + 
+                                     lane_data[i].public_count;
+        
+        // Calculate priority score
+        lane_data[i].priority_score = lane_data[i].emergency_count * 1000 +
+                                     lane_data[i].heavy_count * 100 +
+                                     lane_data[i].public_count * 10 +
+                                     lane_data[i].car_count * 5;
+      }
+    }
+    
+    last_data_time = millis();
+    
+    // Debug output
+    Serial.print("Received data - Priority Lane: ");
+    Serial.println(priority_lane);
+  }
+}
+
+void aiTrafficControl() {
+  unsigned long current_time = millis();
+  unsigned long elapsed = current_time - state_start_time;
+  
+  // Check for emergency vehicles
+  emergency_mode = (lane_data[priority_lane].emergency_count > 0);
+  
+  switch (current_state) {
+    case ALL_RED_START:
+      if (elapsed >= RED_CLEARANCE) {
+        // Start green for priority lane
+        target_lane = priority_lane;
+        setGreenLight(target_lane);
+        current_lane = target_lane;
+        
+        // Calculate green time based on traffic
+        green_duration = calculateGreenTime(current_lane);
+        
+        current_state = GREEN_ACTIVE;
+        state_start_time = current_time;
+        
+        Serial.print("Green light activated for lane ");
+        Serial.print(current_lane);
+        Serial.print(" for ");
+        Serial.print(green_duration / 1000);
+        Serial.println(" seconds");
+      }
+      break;
+      
+    case GREEN_ACTIVE:
+      // Check if we need to change lanes or extend time
+      if (priority_lane != current_lane && !emergency_mode) {
+        // Different priority lane detected
+        if (elapsed >= (green_duration / 2)) { // Allow change after half time
+          startTransition();
+        }
+      } else if (elapsed >= green_duration) {
+        // Time expired
+        startTransition();
+      } else if (priority_lane == current_lane && emergency_mode) {
+        // Extend time for emergency in same lane
+        green_duration = min(green_duration + 5000, EMERGENCY_GREEN);
+      }
+      break;
+      
+    case YELLOW_ACTIVE:
+      if (elapsed >= YELLOW_TIME) {
+        setAllRed();
+        target_lane = priority_lane;
+        current_state = ALL_RED_CLEAR;
+        state_start_time = current_time;
+      }
+      break;
+      
+    case ALL_RED_CLEAR:
+      if (elapsed >= RED_CLEARANCE) {
+        current_state = ALL_RED_START;
+        state_start_time = current_time;
+      }
+      break;
+  }
+}
+
+void startTransition() {
+  setYellowLight(current_lane);
+  current_state = YELLOW_ACTIVE;
+  state_start_time = millis();
+  
+  Serial.print("Yellow light activated for lane ");
+  Serial.println(current_lane);
+}
+
+unsigned long calculateGreenTime(int lane) {
+  LaneData data = lane_data[lane];
+  
+  // Base time
+  unsigned long time = GREEN_TIME_BASE;
+  
+  // Emergency vehicles get priority time
+  if (data.emergency_count > 0) {
+    return EMERGENCY_GREEN;
+  }
+  
+  // Add time based on vehicle count
+  if (data.total_vehicles > 0) {
+    // 1 second per vehicle, max 15 extra seconds
+    unsigned long extra_time = min(data.total_vehicles * 1000UL, 15000UL);
+    time += extra_time;
+  }
+  
+  // Heavy vehicles need more time
+  if (data.heavy_count > 0) {
+    time += data.heavy_count * 2000; // 2 seconds per heavy vehicle
+  }
+  
+  // Cap at maximum time
+  return min(time, GREEN_TIME_MAX);
+}
+
+void defaultTrafficCycle() {
+  // Simple round-robin cycling when no AI data
+  unsigned long current_time = millis();
+  unsigned long elapsed = current_time - state_start_time;
+  
+  switch (current_state) {
+    case ALL_RED_START:
+    case ALL_RED_CLEAR:
+      if (elapsed >= RED_CLEARANCE) {
+        current_lane = (current_lane + 1) % 4;
+        setGreenLight(current_lane);
+        current_state = GREEN_ACTIVE;
+        state_start_time = current_time;
+        green_duration = GREEN_TIME_BASE;
+      }
+      break;
+      
+    case GREEN_ACTIVE:
+      if (elapsed >= green_duration) {
+        setYellowLight(current_lane);
+        current_state = YELLOW_ACTIVE;
+        state_start_time = current_time;
+      }
+      break;
+      
+    case YELLOW_ACTIVE:
+      if (elapsed >= YELLOW_TIME) {
+        setAllRed();
+        current_state = ALL_RED_CLEAR;
+        state_start_time = current_time;
+      }
+      break;
+  }
+}
+
+void setAllRed() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(RED_PINS[i], HIGH);
+    digitalWrite(YELLOW_PINS[i], LOW);
+    digitalWrite(GREEN_PINS[i], LOW);
+  }
+}
+
+void setGreenLight(int lane) {
+  // Set all to red first
+  setAllRed();
+  
+  // Then set the specified lane to green
+  digitalWrite(RED_PINS[lane], LOW);
+  digitalWrite(GREEN_PINS[lane], HIGH);
+}
+
+void setYellowLight(int lane) {
+  // Keep all others red, set specified lane to yellow
+  setAllRed();
+  digitalWrite(RED_PINS[lane], LOW);
+  digitalWrite(YELLOW_PINS[lane], HIGH);
+}
