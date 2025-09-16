@@ -1,102 +1,114 @@
 #include <ArduinoJson.h>
 
 // ==============================
-// PIN DEFINITIONS
+// Pin Definitions for Traffic Lights
 // ==============================
-// Traffic Light Pins (4 lanes: North, East, South, West)
-// Each lane has Red, Yellow, Green
-const int LANE_PINS[4][3] = {
-  {2, 3, 4},    // North Lane: Red, Yellow, Green
-  {5, 6, 7},    // East Lane: Red, Yellow, Green
-  {8, 9, 10},   // South Lane: Red, Yellow, Green
-  {11, 12, 13}  // West Lane: Red, Yellow, Green
-};
+// North Lane (Lane 0)
+#define NORTH_RED_PIN     2
+#define NORTH_YELLOW_PIN  3
+#define NORTH_GREEN_PIN   4
 
-// Sensor and Indicator Pins
-const int RAIN_SENSOR_PIN = A0;  // Rain sensor analog input
-const int RAIN_LED_PIN = 22;     // LED to indicate rain detection
-const int STATUS_LED_PIN = 23;   // System status LED
-const int EMERGENCY_LED_PIN = 24; // Emergency mode indicator LED
+// East Lane (Lane 1)
+#define EAST_RED_PIN      5
+#define EAST_YELLOW_PIN   6
+#define EAST_GREEN_PIN    7
 
-// ==============================
-// TIMING CONSTANTS
-// ==============================
-const int NORMAL_GREEN_TIME = 15000;    // 15 seconds normal green
-const int NORMAL_YELLOW_TIME = 3000;    // 3 seconds yellow
-const int EMERGENCY_RESPONSE_TIME = 500; // 0.5 seconds emergency response
-const int PEDESTRIAN_YELLOW_TIME = 2000; // 2 seconds gradual yellow for pedestrians
-const int RAIN_DELAY_MULTIPLIER = 2;     // Double timing when raining
+// South Lane (Lane 2)
+#define SOUTH_RED_PIN     8
+#define SOUTH_YELLOW_PIN  9
+#define SOUTH_GREEN_PIN   10
 
-// Rain detection threshold (adjust based on your sensor)
-const int RAIN_THRESHOLD = 300;  // Analog reading threshold for rain
+// West Lane (Lane 3)
+#define WEST_RED_PIN      11
+#define WEST_YELLOW_PIN   12
+#define WEST_GREEN_PIN    13
 
-// ==============================
-// SYSTEM VARIABLES
-// ==============================
-struct LaneState {
-  int red_pin, yellow_pin, green_pin;
-  bool is_green, is_yellow, is_red;
-  unsigned long state_start_time;
-};
+// Optional: Status LED and Buzzer
+#define STATUS_LED_PIN    A0
+#define BUZZER_PIN        A1
 
-LaneState lanes[4];
-int current_priority_lane = 0;
-String current_priority_type = "normal";
-bool emergency_active = false;
-bool rain_detected = false;
-bool system_initialized = false;
-
-unsigned long last_data_received = 0;
-const unsigned long DATA_TIMEOUT = 10000; // 10 seconds timeout
-
-// JSON document for parsing
-StaticJsonDocument<1024> json_doc;
+// Rain Sensor
+#define RAIN_SENSOR_PIN   A2
+#define RAIN_STATUS_LED   A3
 
 // ==============================
-// SETUP FUNCTION
+// Configuration
+// ==============================
+#define SERIAL_BAUDRATE   9600
+#define JSON_BUFFER_SIZE  1024
+#define PEDESTRIAN_CROSSING_TIME 15000 // 15 seconds for pedestrian crossing
+#define RAINY_PEDESTRIAN_TIME 20000    // 20 seconds for pedestrian crossing when raining
+
+// Rain Detection
+#define RAIN_THRESHOLD    500     // Analog threshold for rain detection (adjust as needed)
+#define RAIN_CHECK_INTERVAL 2000  // Check rain sensor every 2 seconds
+
+// ==============================
+// Global Variables
+// ==============================
+int currentPriorityLane = 0;
+int previousPriorityLane = -1;  // Track previous priority lane
+String currentPriorityType = "normal";
+bool pedestrianActive = false;
+bool emergencyActive = false;
+
+// Rain Detection Variables
+bool rainDetected = false;
+unsigned long lastRainCheck = 0;
+
+unsigned long lastUpdate = 0;
+unsigned long pedestrianStartTime = 0;
+
+// Traffic light state arrays
+int redPins[4] = {NORTH_RED_PIN, EAST_RED_PIN, SOUTH_RED_PIN, WEST_RED_PIN};
+int yellowPins[4] = {NORTH_YELLOW_PIN, EAST_YELLOW_PIN, SOUTH_YELLOW_PIN, WEST_YELLOW_PIN};
+int greenPins[4] = {NORTH_GREEN_PIN, EAST_GREEN_PIN, SOUTH_GREEN_PIN, WEST_GREEN_PIN};
+
+String laneNames[4] = {"North", "East", "South", "West"};
+
+// ==============================
+// Setup Function
 // ==============================
 void setup() {
-  Serial.begin(9600);
+  // Initialize serial communication
+  Serial.begin(SERIAL_BAUDRATE);
   
-  // Initialize lane structures and pins
+  // Initialize all traffic light pins
   for (int i = 0; i < 4; i++) {
-    lanes[i].red_pin = LANE_PINS[i][0];
-    lanes[i].yellow_pin = LANE_PINS[i][1];
-    lanes[i].green_pin = LANE_PINS[i][2];
-    
-    // Set pins as output
-    pinMode(lanes[i].red_pin, OUTPUT);
-    pinMode(lanes[i].yellow_pin, OUTPUT);
-    pinMode(lanes[i].green_pin, OUTPUT);
-    
-    // Initialize all lights as RED (safe state)
-    digitalWrite(lanes[i].red_pin, HIGH);
-    digitalWrite(lanes[i].yellow_pin, LOW);
-    digitalWrite(lanes[i].green_pin, LOW);
-    
-    lanes[i].is_red = true;
-    lanes[i].is_yellow = false;
-    lanes[i].is_green = false;
-    lanes[i].state_start_time = millis();
+    pinMode(redPins[i], OUTPUT);
+    pinMode(yellowPins[i], OUTPUT);
+    pinMode(greenPins[i], OUTPUT);
   }
   
-  // Initialize sensor and indicator pins
-  pinMode(RAIN_SENSOR_PIN, INPUT);
-  pinMode(RAIN_LED_PIN, OUTPUT);
+  // Initialize status indicators
   pinMode(STATUS_LED_PIN, OUTPUT);
-  pinMode(EMERGENCY_LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RAIN_STATUS_LED, OUTPUT);
   
-  // Turn on status LED to indicate system is ready
+  // Initialize rain sensor
+  pinMode(RAIN_SENSOR_PIN, INPUT);
+  
+  // Start with all lanes red for safety
+  setAllLanesRed();
+  
+  // Status indication
   digitalWrite(STATUS_LED_PIN, HIGH);
+  digitalWrite(RAIN_STATUS_LED, LOW);
   
-  Serial.println("🚦 AI Traffic Management System - Arduino Controller");
-  Serial.println("✅ System initialized - All lanes set to RED (Safe Mode)");
-  Serial.println("📡 Waiting for Python script data...");
-  Serial.println("==========================================");
+  Serial.println("=================================");
+  Serial.println("🚦 Arduino Traffic Light Controller");
+  Serial.println("🎯 Features: Emergency Priority, Pedestrian Safety, Rain Detection");
+  Serial.println("🌧️ Rain sensor initialized on pin A2");
+  Serial.println("🤖 Full Python control - Arduino only executes commands");
+  Serial.println("📡 Waiting for Python data...");
+  Serial.println("=================================");
+  
+  lastUpdate = millis();
+  lastRainCheck = millis();
 }
 
 // ==============================
-// MAIN LOOP
+// Main Loop
 // ==============================
 void loop() {
   // Check for rain
@@ -104,354 +116,257 @@ void loop() {
   
   // Check for incoming serial data
   if (Serial.available()) {
-    String json_string = Serial.readStringUntil('\n');
-    parseTrafficData(json_string);
-    last_data_received = millis();
+    processSerialData();
   }
   
-  // Handle traffic light control
-  controlTrafficLights();
+  // Only manage pedestrian crossing timing (safety requirement)
+  managePedestrianCrossing();
   
-  // Safety timeout - if no data received for too long, go to safe mode
-  if (millis() - last_data_received > DATA_TIMEOUT && system_initialized) {
-    enterSafeMode();
+  // Status LED heartbeat (blink every second)
+  if (millis() % 1000 < 100) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+  } else {
+    digitalWrite(STATUS_LED_PIN, LOW);
   }
-  
-  // Blink status LED to show system is running
-  blinkStatusLED();
-  
-  delay(50); // Small delay to prevent excessive processing
 }
 
 // ==============================
-// RAIN SENSOR FUNCTIONS
+// Rain Detection
 // ==============================
 void checkRainSensor() {
-  int rain_value = analogRead(RAIN_SENSOR_PIN);
-  bool previous_rain_state = rain_detected;
+  unsigned long currentTime = millis();
   
-  rain_detected = (rain_value > RAIN_THRESHOLD);
-  
-  // Update rain LED
-  digitalWrite(RAIN_LED_PIN, rain_detected ? HIGH : LOW);
-  
-  // Print rain status change
-  if (rain_detected != previous_rain_state) {
-    Serial.println("==========================================");
-    if (rain_detected) {
-      Serial.print("🌧️ RAIN DETECTED! Sensor value: ");
-      Serial.println(rain_value);
-      Serial.println("⏰ Switching to slower timing mode");
-    } else {
-      Serial.print("☀️ Rain stopped. Sensor value: ");
-      Serial.println(rain_value);
-      Serial.println("⏰ Returning to normal timing mode");
+  // Check rain sensor every RAIN_CHECK_INTERVAL milliseconds
+  if (currentTime - lastRainCheck >= RAIN_CHECK_INTERVAL) {
+    int rainValue = analogRead(RAIN_SENSOR_PIN);
+    bool previousRainState = rainDetected;
+    
+    // Rain is detected when sensor value is below threshold (wet sensor has lower resistance)
+    rainDetected = (rainValue < RAIN_THRESHOLD);
+    
+    // Update rain status LED
+    digitalWrite(RAIN_STATUS_LED, rainDetected ? HIGH : LOW);
+    
+    // Print status when rain state changes
+    if (rainDetected != previousRainState) {
+      if (rainDetected) {
+        Serial.println("🌧️ RAIN DETECTED! Extended pedestrian crossing time available");
+        Serial.println("   Rain sensor value: " + String(rainValue));
+      } else {
+        Serial.println("☀️ Rain stopped. Normal pedestrian crossing time");
+        Serial.println("   Rain sensor value: " + String(rainValue));
+      }
     }
-    Serial.println("==========================================");
+    
+    lastRainCheck = currentTime;
   }
 }
 
 // ==============================
-// DATA PARSING FUNCTIONS
+// Get Current Pedestrian Crossing Time Based on Rain Status
 // ==============================
-void parseTrafficData(String json_string) {
-  // Clear previous data
-  json_doc.clear();
+unsigned long getCurrentPedestrianTime() {
+  return rainDetected ? RAINY_PEDESTRIAN_TIME : PEDESTRIAN_CROSSING_TIME;
+}
+
+// ==============================
+// Serial Data Processing
+// ==============================
+void processSerialData() {
+  String jsonString = Serial.readStringUntil('\n');
+  jsonString.trim();
+  
+  if (jsonString.length() == 0) return;
   
   // Parse JSON
-  DeserializationError error = deserializeJson(json_doc, json_string);
+  StaticJsonDocument<JSON_BUFFER_SIZE> doc;
+  DeserializationError error = deserializeJson(doc, jsonString);
   
   if (error) {
-    Serial.print("❌ JSON parsing error: ");
-    Serial.println(error.c_str());
+    Serial.println("❌ JSON parsing failed: " + String(error.c_str()));
     return;
   }
   
   // Extract data
-  int new_priority_lane = json_doc["priority_lane"];
-  String new_priority_type = json_doc["priority_type"].as<String>();
+  int priorityLane = doc["priority_lane"];
+  int prevPriorityLane = doc["previous_priority_lane"];
+  String priorityType = doc["priority_type"].as<String>();
   
-  // Print received data
-  Serial.println("==========================================");
-  Serial.println("📡 RECEIVED TRAFFIC DATA");
-  Serial.println("==========================================");
-  Serial.print("🎯 Priority Lane: ");
-  Serial.print(getLaneName(new_priority_lane));
-  Serial.print(" (ID: ");
-  Serial.print(new_priority_lane);
-  Serial.println(")");
-  Serial.print("🔥 Priority Type: ");
-  new_priority_type.toUpperCase();
-  Serial.println(new_priority_type);
-  
-  // Print lane detection data
-  JsonObject lane_data = json_doc["lane_data"];
-  for (int i = 0; i < 4; i++) {
-    Serial.print("📊 ");
-    Serial.print(getLaneName(i));
-    Serial.print(" Lane: ");
-    
-    JsonObject lane = lane_data[String(i)];
-    Serial.print("Cars:");
-    Serial.print((int)lane["car"]);
-    Serial.print(" Emergency:");
-    Serial.print((int)lane["emergency"]);
-    Serial.print(" Heavy:");
-    Serial.print((int)lane["heavy"]);
-    Serial.print(" Pedestrian:");
-    Serial.print((int)lane["pedestrian"]);
-    Serial.print(" Public:");
-    Serial.println((int)lane["public"]);
+  Serial.println("\n📨 Received data from Python:");
+  Serial.println("  Priority Lane: " + String(priorityLane));
+  Serial.println("  Previous Priority Lane: " + String(prevPriorityLane));
+  Serial.println("  Priority Type: " + priorityType);
+  if (rainDetected) {
+    Serial.println("  🌧️ Rain Mode: Extended pedestrian time if needed");
   }
   
-  // Check if this is an emergency situation
-  bool new_emergency = (new_priority_type == "emergency");
+  // Update global state
+  currentPriorityLane = priorityLane;
+  previousPriorityLane = prevPriorityLane;
+  currentPriorityType = priorityType;
   
-  if (new_emergency && !emergency_active) {
-    Serial.println("🚨 EMERGENCY MODE ACTIVATED! 🚨");
-    Serial.println("⚡ Immediate response required!");
-  } else if (!new_emergency && emergency_active) {
-    Serial.println("✅ Emergency cleared - returning to normal operation");
-  }
-  
-  // Update system state
-  current_priority_lane = new_priority_lane;
-  current_priority_type = new_priority_type;
-  emergency_active = new_emergency;
-  system_initialized = true;
-  
-  Serial.println("==========================================");
-}
-
-// ==============================
-// TRAFFIC LIGHT CONTROL
-// ==============================
-void controlTrafficLights() {
-  if (!system_initialized) {
-    return; // Wait for first data
-  }
-  
-  if (emergency_active) {
-    handleEmergencyMode();
-  } else if (current_priority_type == "pedestrian") {
-    handlePedestrianMode();
+  // Handle different priority types
+  if (priorityType == "emergency") {
+    handleEmergencyVehicle(priorityLane, prevPriorityLane);
+  } else if (priorityType == "pedestrian_safety") {
+    handlePedestrianSafety(priorityLane, prevPriorityLane);
   } else {
-    handleNormalMode();
+    handleNormalTraffic(priorityLane, prevPriorityLane);
+  }
+  
+  lastUpdate = millis();
+}
+
+// ==============================
+// Pedestrian Crossing Management (Only for pedestrians)
+// ==============================
+void managePedestrianCrossing() {
+  if (!pedestrianActive) return;
+  
+  unsigned long currentTime = millis();
+  unsigned long pedestrianElapsed = currentTime - pedestrianStartTime;
+  
+  // Check if pedestrian crossing time is complete
+  if (pedestrianElapsed >= getCurrentPedestrianTime()) {
+    pedestrianActive = false;
+    Serial.println("🚶 Pedestrian crossing time completed");
+    Serial.println("✅ Ready for next Python command");
   }
 }
 
-void handleEmergencyMode() {
-  // Turn on emergency LED
-  digitalWrite(EMERGENCY_LED_PIN, HIGH);
+// ==============================
+// Priority Handlers
+// ==============================
+void handlePedestrianSafety(int lane, int prevLane) {
+  Serial.println("🚶 PEDESTRIAN SAFETY MODE ACTIVATED");
+  Serial.println("🔴 All lanes set to RED for pedestrian crossing");
+  if (rainDetected) {
+    Serial.println("🌧️ Extended pedestrian crossing time due to rain: " + String(getCurrentPedestrianTime()/1000) + " seconds");
+  } else {
+    Serial.println("⏱️ Pedestrian crossing time: " + String(getCurrentPedestrianTime()/1000) + " seconds");
+  }
   
-  // Immediately set all lanes to RED except priority lane
+  pedestrianActive = true;
+  emergencyActive = false;
+  
+  // Set previous priority lane to yellow, then all red
+  if (prevLane >= 0 && prevLane <= 3) {
+    Serial.println("🟡 Setting " + laneNames[prevLane] + " to YELLOW (transition)");
+    digitalWrite(yellowPins[prevLane], HIGH);
+    digitalWrite(greenPins[prevLane], LOW);
+    delay(2000); // Yellow for 2 seconds
+  }
+  
+  setAllLanesRed();
+  activatePedestrianSignal();
+  
+  pedestrianStartTime = millis();
+}
+
+void handleEmergencyVehicle(int lane, int prevLane) {
+  Serial.println("🚨 EMERGENCY VEHICLE DETECTED!");
+  Serial.println("🟢 Immediate priority given to " + laneNames[lane] + " lane");
+  Serial.println("⚠️  Emergency overrides pedestrian safety");
+  
+  emergencyActive = true;
+  pedestrianActive = false;  // Emergency overrides pedestrian mode
+  
+  // Set previous priority lane to yellow if different from emergency lane
+  if (prevLane >= 0 && prevLane <= 3 ) {
+    Serial.println("🟡 Setting " + laneNames[prevLane] + " to YELLOW (transition)");
+    digitalWrite(yellowPins[prevLane], HIGH);
+    digitalWrite(greenPins[prevLane], LOW);
+    delay(1500); // Shorter yellow for emergency
+  }
+  
+  // All red for safety
+  setAllLanesRed();
+  delay(500); // Brief all-red for safety
+  
+  // Green for emergency lane
+  digitalWrite(redPins[lane], LOW);
+  digitalWrite(greenPins[lane], HIGH);
+  Serial.println("🟢 " + laneNames[lane] + " lane activated for EMERGENCY");
+  
+  activateEmergencyAlert();
+  
+  Serial.println("🤖 Python controls emergency duration");
+}
+
+void handleNormalTraffic(int lane, int prevLane) {
+  Serial.println("🚦 Normal traffic command received");
+  Serial.println("🟢 Setting " + laneNames[lane] + " lane to GREEN");
+  
+  emergencyActive = false;
+  pedestrianActive = false;
+  
+  // Set previous priority lane to yellow if different from new priority lane
+  if (prevLane >= 0 && prevLane <= 3 && prevLane != lane) {
+    Serial.println("🟡 Setting " + laneNames[prevLane] + " to YELLOW (transition)");
+    digitalWrite(yellowPins[prevLane], HIGH);
+    digitalWrite(greenPins[prevLane], LOW);
+    delay(2000); // Yellow for 2 seconds
+  }
+  
+  // All red first
+  setAllLanesRed();
+  delay(500); // Brief safety delay
+  
+  // Green for priority lane
+  digitalWrite(redPins[lane], LOW);
+  digitalWrite(greenPins[lane], HIGH);
+  Serial.println("🟢 " + laneNames[lane] + " lane activated");
+  
+  Serial.println("✅ Lane activated - Python controls duration");
+}
+
+// ==============================
+// Utility Functions
+// ==============================
+void setAllLanesRed() {
+  // Turn on all red lights, turn off yellow and green
   for (int i = 0; i < 4; i++) {
-    if (i != current_priority_lane) {
-      setLaneState(i, "red");
-    }
+    digitalWrite(redPins[i], HIGH);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
   }
-  
-  // Give GREEN to emergency lane immediately
-  setLaneState(current_priority_lane, "green");
 }
 
-void handlePedestrianMode() {
-  // Turn off emergency LED
-  digitalWrite(EMERGENCY_LED_PIN, LOW);
-  
-  // Gradually transition other lanes to RED via YELLOW
+void setAllLanesOff() {
+  // Turn off all lights (emergency/maintenance mode)
   for (int i = 0; i < 4; i++) {
-    if (i != current_priority_lane) {
-      // If currently green, go to yellow first
-      if (lanes[i].is_green) {
-        setLaneState(i, "yellow");
-      }
-      // If yellow for enough time, go to red
-      else if (lanes[i].is_yellow && 
-               (millis() - lanes[i].state_start_time > getYellowTime())) {
-        setLaneState(i, "red");
-      }
-    }
-  }
-  
-  // Set priority lane to GREEN (pedestrian can cross)
-  setLaneState(current_priority_lane, "green");
-}
-
-void handleNormalMode() {
-  // Turn off emergency LED
-  digitalWrite(EMERGENCY_LED_PIN, LOW);
-  
-  // FIXED: When priority lane changes, transition other lanes through yellow to red
-  static int last_priority_lane = -1;
-  
-  if (last_priority_lane != current_priority_lane) {
-    // Priority lane has changed - transition all other green lanes to yellow first
-    for (int i = 0; i < 4; i++) {
-      if (i != current_priority_lane && lanes[i].is_green) {
-        setLaneState(i, "yellow");
-      }
-    }
-    last_priority_lane = current_priority_lane;
-  }
-  
-  // Handle transitions for all lanes
-  for (int i = 0; i < 4; i++) {
-    if (i == current_priority_lane) {
-      // Priority lane: Red -> Green (after others are clear)
-      bool others_cleared = true;
-      for (int j = 0; j < 4; j++) {
-        if (j != i && !lanes[j].is_red) {
-          others_cleared = false;
-          break;
-        }
-      }
-      
-      if (others_cleared) {
-        setLaneState(i, "green");
-      }
-    } else {
-      // Non-priority lanes: handle Yellow -> Red transition
-      if (lanes[i].is_yellow) {
-        if (millis() - lanes[i].state_start_time > getYellowTime()) {
-          setLaneState(i, "red");
-        }
-      }
-    }
+    digitalWrite(redPins[i], LOW);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
   }
 }
 
-void setLaneState(int lane_id, String state) {
-  if (lane_id < 0 || lane_id > 3) return;
+void activatePedestrianSignal() {
+  // Visual and audio indication for pedestrian crossing
+  Serial.println("🔊 Pedestrian crossing signal activated");
   
-  LaneState* lane = &lanes[lane_id];
-  bool state_changed = false;
-  
-  // Update state
-  if (state == "red" && !lane->is_red) {
-    digitalWrite(lane->red_pin, HIGH);
-    digitalWrite(lane->yellow_pin, LOW);
-    digitalWrite(lane->green_pin, LOW);
-    lane->is_red = true;
-    lane->is_yellow = false;
-    lane->is_green = false;
-    state_changed = true;
-  } else if (state == "yellow" && !lane->is_yellow) {
-    digitalWrite(lane->red_pin, LOW);
-    digitalWrite(lane->yellow_pin, HIGH);
-    digitalWrite(lane->green_pin, LOW);
-    lane->is_red = false;
-    lane->is_yellow = true;
-    lane->is_green = false;
-    state_changed = true;
-  } else if (state == "green" && !lane->is_green) {
-    digitalWrite(lane->red_pin, LOW);
-    digitalWrite(lane->yellow_pin, LOW);
-    digitalWrite(lane->green_pin, HIGH);
-    lane->is_red = false;
-    lane->is_yellow = false;
-    lane->is_green = true;
-    state_changed = true;
-  }
-  
-  // Update timestamp if state changed
-  if (state_changed) {
-    lane->state_start_time = millis();
-    Serial.print("🚦 ");
-    Serial.print(getLaneName(lane_id));
-    Serial.print(" Lane -> ");
-    state.toUpperCase();
-    Serial.println(state);
+  // Sound pattern for pedestrian crossing
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(200);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(200);
   }
 }
 
-// ==============================
-// TIMING FUNCTIONS
-// ==============================
-unsigned long getGreenTime() {
-  return rain_detected ? (NORMAL_GREEN_TIME * RAIN_DELAY_MULTIPLIER) : NORMAL_GREEN_TIME;
-}
-
-unsigned long getYellowTime() {
-  // Use standard yellow time for normal and emergency modes
-  return rain_detected ? (NORMAL_YELLOW_TIME * RAIN_DELAY_MULTIPLIER) : NORMAL_YELLOW_TIME;
-}
-
-unsigned long getPedestrianYellowTime() {
-  // Special longer yellow time for pedestrian safety (gradual transition)
-  return rain_detected ? (PEDESTRIAN_YELLOW_TIME * RAIN_DELAY_MULTIPLIER) : PEDESTRIAN_YELLOW_TIME;
-}
-
-// ==============================
-// UTILITY FUNCTIONS
-// ==============================
-String getLaneName(int lane_id) {
-  switch (lane_id) {
-    case 0: return "North";
-    case 1: return "East";
-    case 2: return "South";
-    case 3: return "West";
-    default: return "Unknown";
+void activateEmergencyAlert() {
+  // Visual and audio indication for emergency vehicle
+  Serial.println("🔊 Emergency vehicle alert activated");
+  
+  // Sound pattern for emergency
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
   }
 }
 
-void enterSafeMode() {
-  Serial.println("⚠️ ENTERING SAFE MODE - No data from Python script");
-  Serial.println("🔴 All lanes set to RED for safety");
-  
-  // Set all lanes to RED
-  for (int i = 0; i < 4; i++) {
-    setLaneState(i, "red");
-  }
-  
-  // Turn off emergency LED
-  digitalWrite(EMERGENCY_LED_PIN, LOW);
-  
-  system_initialized = false;
-  emergency_active = false;
-}
 
-void blinkStatusLED() {
-  static unsigned long last_blink = 0;
-  static bool led_state = false;
-  
-  if (millis() - last_blink > 1000) { // Blink every second
-    led_state = !led_state;
-    digitalWrite(STATUS_LED_PIN, led_state ? HIGH : LOW);
-    last_blink = millis();
-  }
-}
 
-// ==============================
-// DEBUG FUNCTIONS
-// ==============================
-void printSystemStatus() {
-  Serial.println("==========================================");
-  Serial.println("🔍 SYSTEM STATUS");
-  Serial.println("==========================================");
-  Serial.print("⏰ Current Time: ");
-  Serial.println(millis());
-  Serial.print("🌧️ Rain Detected: ");
-  Serial.println(rain_detected ? "YES" : "NO");
-  Serial.print("🚨 Emergency Active: ");
-  Serial.println(emergency_active ? "YES" : "NO");
-  Serial.print("🎯 Priority Lane: ");
-  Serial.println(getLaneName(current_priority_lane));
-  Serial.print("📡 Last Data: ");
-  Serial.print((millis() - last_data_received) / 1000);
-  Serial.println(" seconds ago");
-  
-  // Print lane states
-  for (int i = 0; i < 4; i++) {
-    Serial.print("🚦 ");
-    Serial.print(getLaneName(i));
-    Serial.print(": ");
-    if (lanes[i].is_red) Serial.print("RED");
-    else if (lanes[i].is_yellow) Serial.print("YELLOW");
-    else if (lanes[i].is_green) Serial.print("GREEN");
-    Serial.print(" (");
-    Serial.print((millis() - lanes[i].state_start_time) / 1000);
-    Serial.println("s)");
-  }
-  Serial.println("==========================================");
-}
+
