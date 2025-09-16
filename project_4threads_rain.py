@@ -15,14 +15,14 @@ import torch
 # ==============================
 # ESP32 cameras configuration (4 lanes: North, East, South, West)
 CAMERAS = [
-    {"name": "North_Lane", "ip": "10.210.0.172", "model_path": "best.pt", "window_pos": (0, 0), "lane_id": 0},
-    {"name": "East_Lane", "ip": "10.210.800.172", "model_path": "best.pt", "window_pos": (640, 0), "lane_id": 1},
-    {"name": "South_Lane", "ip": "10.210.80.172", "model_path": "best.pt", "window_pos": (0, 480), "lane_id": 2},
+    {"name": "North_Lane", "ip": "10.210.80.144", "model_path": "best.pt", "window_pos": (0, 0), "lane_id": 0},
+    {"name": "East_Lane", "ip": "10.210.80.172", "model_path": "best.pt", "window_pos": (640, 0), "lane_id": 1},
+    {"name": "South_Lane", "ip": "10.210.80.74", "model_path": "best.pt", "window_pos": (0, 480), "lane_id": 2},
     {"name": "West_Lane", "ip": "10.210.80.144", "model_path": "best.pt", "window_pos": (640, 480), "lane_id": 3}
 ]
 
 # Serial Configuration
-SERIAL_PORT = "COM5"  # Change to your Arduino port (e.g., "/dev/ttyUSB0" for Linux)
+SERIAL_PORT = "COM9"  # Change to your Arduino port
 SERIAL_BAUDRATE = 9600
 
 # Global configuration
@@ -33,13 +33,13 @@ print(f"Using device: {device}")
 class_names = {0: 'car', 1: 'emergency', 2: 'heavy', 3: 'pedestrian', 4: 'public'}
 class_colors = {0: (0, 255, 0), 1: (0, 0, 255), 2: (255, 165, 0), 3: (255, 0, 0), 4: (128, 0, 128)}
 
-# Priority weights for each class (higher = more priority)
+# Priority weights for each class
 PRIORITY_WEIGHTS = {
     'emergency': 1000,  # Highest priority - immediate action
-    'heavy': 80,  # Heavy vehicles need more time
-    'car': 50,  # Standard vehicles
-    'public': 60,  # Public transport gets slight priority
-    'pedestrian': 40  # Pedestrians get gradual priority
+    'heavy': 80,
+    'public': 60,
+    'car': 50,
+    'pedestrian': 40
 }
 
 # Create directory for saved images
@@ -51,7 +51,6 @@ print("Starting AI Traffic Management System...")
 print("Press 'q' on any window to quit all cameras")
 print("Press 's' on focused window to save current frame from that camera")
 
-
 # ==============================
 # Traffic Priority Manager
 # ==============================
@@ -60,9 +59,9 @@ class TrafficPriorityManager:
         self.serial_conn = serial_connection
         self.lane_data = [{'car': 0, 'emergency': 0, 'heavy': 0, 'pedestrian': 0, 'public': 0} for _ in range(4)]
         self.current_priority_lane = 0
-        self.emergency_active = False
+        self.previous_priority_lane = -1  # Track previous priority lane
         self.last_update_time = time.time()
-        self.update_interval = 2.0  # Update every 2 seconds
+        self.update_interval = 4.0  # Update every 4 seconds
 
     def update_lane_data(self, lane_id, detections):
         """Update detection data for a specific lane"""
@@ -97,7 +96,8 @@ class TrafficPriorityManager:
         lane_scores = []
         emergency_detected = False
         emergency_lane = -1
-        pedestrian_lanes = []
+        pedestrians_detected = False
+        pedestrian_lane = -1
 
         # Calculate scores for all lanes
         for i, lane_data in enumerate(self.lane_data):
@@ -110,7 +110,7 @@ class TrafficPriorityManager:
             print(f"  Score Breakdown: {breakdown if breakdown else 'No vehicles detected'}")
             print(f"  Total Score: {score}")
 
-            # Check for emergency vehicles
+            # Check for emergency vehicles (highest priority)
             if lane_data.get('emergency', 0) > 0:
                 emergency_detected = True
                 emergency_lane = i
@@ -118,34 +118,41 @@ class TrafficPriorityManager:
 
             # Check for pedestrians
             if lane_data.get('pedestrian', 0) > 0:
-                pedestrian_lanes.append(i)
+                pedestrians_detected = True
+                pedestrian_lane = i
                 print(f"  🚶 Pedestrian detected")
 
             print()
 
-        # Determine priority based on conditions
+        # Store previous priority lane
+        self.previous_priority_lane = self.current_priority_lane
+
+        # Determine priority based on conditions (Emergency has highest priority)
         if emergency_detected:
             priority_lane = emergency_lane
-            priority_type = "EMERGENCY"
-            self.emergency_active = True
-        elif pedestrian_lanes:
-            # If multiple pedestrian lanes, choose the one with highest score
-            priority_lane = max(pedestrian_lanes, key=lambda x: lane_scores[x])
-            priority_type = "PEDESTRIAN"
-            self.emergency_active = False
+            priority_type = "emergency"
+            print(f"PRIORITY DECISION: EMERGENCY")
+            print(f"  Lane: {['North', 'East', 'South', 'West'][priority_lane]} (ID: {priority_lane})")
+        elif pedestrians_detected:
+            # For pedestrian safety, we send the lane where pedestrian is detected
+            # Arduino will handle making that lane yellow first, then all red
+            priority_lane = pedestrian_lane
+            priority_type = "pedestrian_safety"
+            print(f"PRIORITY DECISION: PEDESTRIAN SAFETY")
+            print(f"  Pedestrian Lane: {['North', 'East', 'South', 'West'][priority_lane]} (ID: {priority_lane})")
+            print(f"  All lanes will go RED for pedestrian crossing")
         else:
             # Normal traffic flow - highest score wins
             priority_lane = lane_scores.index(max(lane_scores))
-            priority_type = "NORMAL"
-            self.emergency_active = False
+            priority_type = "normal"
+            print(f"PRIORITY DECISION: NORMAL TRAFFIC")
+            print(f"  Lane: {['North', 'East', 'South', 'West'][priority_lane]} (ID: {priority_lane})")
+            print(f"  Score: {lane_scores[priority_lane]}")
 
-        print(f"PRIORITY DECISION:")
-        print(f"  Type: {priority_type}")
-        print(f"  Lane: {['North', 'East', 'South', 'West'][priority_lane]} (ID: {priority_lane})")
-        print(f"  Score: {lane_scores[priority_lane]}")
+        print(f"  Previous Priority Lane: {self.previous_priority_lane}")
 
         # Send data to Arduino
-        self.send_traffic_data(priority_lane, priority_type.lower())
+        self.send_traffic_data(priority_lane, priority_type)
         self.current_priority_lane = priority_lane
         self.last_update_time = current_time
         print(f"{'=' * 60}\n")
@@ -155,18 +162,20 @@ class TrafficPriorityManager:
         try:
             traffic_data = {
                 "priority_lane": priority_lane,
+                "previous_priority_lane": self.previous_priority_lane,
                 "priority_type": priority_type,
-                "lane_data": self.lane_data,
                 "timestamp": int(time.time())
             }
 
             json_data = json.dumps(traffic_data)
             self.serial_conn.write((json_data + '\n').encode())
-            print(f"📤 Sent to Arduino: Priority Lane {priority_lane} ({priority_type})")
+
+            print(f"📤 Sent to Arduino:")
+            print(f"   Priority Lane: {priority_lane} ({priority_type})")
+            print(f"   Previous Lane: {self.previous_priority_lane}")
 
         except Exception as e:
             print(f"❌ Serial communication error: {e}")
-
 
 # ==============================
 # Camera Detection Thread Class
@@ -182,7 +191,7 @@ class CameraDetector:
         self.stop_event = stop_event
         self.priority_manager = priority_manager
 
-        # Load YOLO model with GPU optimization
+        # Load YOLO model
         self.model = YOLO(self.model_path)
         if device == "cuda":
             self.model.to(device).half()
@@ -205,7 +214,7 @@ class CameraDetector:
         print(f"[{self.name}] Initialized on {self.ip}")
 
     def grab_and_process_frames(self):
-        """Simplified frame grabbing and processing in single thread"""
+        """Frame grabbing and processing"""
         while not self.stop_event.is_set():
             try:
                 # Grab frame from ESP32
@@ -266,7 +275,7 @@ class CameraDetector:
 
             except Exception as e:
                 print(f"[{self.name}] Error: {e}")
-                time.sleep(1)  # Wait before retrying
+                time.sleep(1)
 
     def add_info_overlay(self, frame, counts, inference_time):
         """Add information overlay to frame"""
@@ -289,7 +298,13 @@ class CameraDetector:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         # Priority indicator
-        if self.lane_id == self.priority_manager.current_priority_lane:
+        if counts.get('emergency', 0) > 0:
+            cv2.putText(frame, "🚨 EMERGENCY DETECTED", (10, y_pos + 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        elif counts.get('pedestrian', 0) > 0:
+            cv2.putText(frame, "🚶 PEDESTRIAN DETECTED", (10, y_pos + 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        elif self.lane_id == self.priority_manager.current_priority_lane:
             cv2.putText(frame, "🟢 PRIORITY LANE", (10, y_pos + 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
@@ -441,7 +456,7 @@ if __name__ == "__main__":
         print(f"💾 CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     print("\n🚦 AI Traffic Management System")
-    print("🎯 Features: Priority detection, Emergency response, Weather awareness")
+    print("🎯 Features: Priority detection, Emergency response, Pedestrian safety")
 
     system = TrafficManagementSystem()
     system.run()
