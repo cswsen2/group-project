@@ -18,7 +18,7 @@ from queue import Queue
 CAMERAS = [
     {"name": "North_Lane", "ip": "10.148.188.144", "model_path": "best.pt", "window_pos": (0, 0), "lane_id": 0},
     {"name": "East_Lane", "ip": "10.148.188.86", "model_path": "best.pt", "window_pos": (640, 0), "lane_id": 1},
-    {"name": "South_Lane", "ip": "10.210.80.74", "model_path": "best.pt", "window_pos": (0, 480), "lane_id": 2},
+    {"name": "South_Lane", "ip": "10.148.188.172", "model_path": "best.pt", "window_pos": (0, 480), "lane_id": 2},
     {"name": "West_Lane", "ip": "10.210.80.144", "model_path": "best.pt", "window_pos": (640, 480), "lane_id": 3}
 ]
 
