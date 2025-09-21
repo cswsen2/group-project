@@ -15,10 +15,10 @@ import torch
 # ==============================
 # ESP32 cameras configuration (4 lanes: North, East, South, West)
 CAMERAS = [
-    {"name": "North_Lane", "ip": "10.210.80.144", "model_path": "best.pt", "window_pos": (0, 0), "lane_id": 0},
-    {"name": "East_Lane", "ip": "10.210.80.172", "model_path": "best.pt", "window_pos": (640, 0), "lane_id": 1},
-    {"name": "South_Lane", "ip": "10.210.80.74", "model_path": "best.pt", "window_pos": (0, 480), "lane_id": 2},
-    {"name": "West_Lane", "ip": "10.210.80.144", "model_path": "best.pt", "window_pos": (640, 480), "lane_id": 3}
+    {"name": "North_Lane", "ip": "10.148.188.144", "model_path": "best_old.pt", "window_pos": (0, 0), "lane_id": 0},
+    {"name": "East_Lane", "ip": "10.210.80.172", "model_path": "best_old.pt", "window_pos": (640, 0), "lane_id": 1},
+    {"name": "South_Lane", "ip": "10.210.80.74", "model_path": "best_old.pt", "window_pos": (0, 480), "lane_id": 2},
+    {"name": "West_Lane", "ip": "10.210.80.144", "model_path": "best_old.pt", "window_pos": (640, 480), "lane_id": 3}
 ]
 
 # Serial Configuration
@@ -218,7 +218,7 @@ class CameraDetector:
         while not self.stop_event.is_set():
             try:
                 # Grab frame from ESP32
-                response = self.session.get(self.url, timeout=4)
+                response = self.session.get(self.url, timeout=2)
                 if response.status_code == 200:
                     img_array = np.frombuffer(response.content, dtype=np.uint8)
                     frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -230,7 +230,7 @@ class CameraDetector:
 
                         # Run detection
                         start = time.time()
-                        results = self.model(frame, conf=0.5, imgsz=320, verbose=False)
+                        results = self.model(frame, conf=0.0, imgsz=320, verbose=False)
                         end = time.time()
                         inference_time = (end - start) * 1000
 
