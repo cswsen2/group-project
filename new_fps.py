@@ -16,10 +16,10 @@ from queue import Queue
 # ==============================
 # ESP32 cameras configuration (4 lanes: North, East, South, West)
 CAMERAS = [
-    {"name": "North_Lane", "ip": "10.148.188.144", "model_path": "best_old.pt", "window_pos": (0, 0), "lane_id": 0},
-    {"name": "East_Lane", "ip": "10.210.80.172", "model_path": "best_old.pt", "window_pos": (640, 0), "lane_id": 1},
-    {"name": "South_Lane", "ip": "10.210.80.74", "model_path": "best_old.pt", "window_pos": (0, 480), "lane_id": 2},
-    {"name": "West_Lane", "ip": "10.210.80.144", "model_path": "best_old.pt", "window_pos": (640, 480), "lane_id": 3}
+    {"name": "North_Lane", "ip": "10.148.188.144", "model_path": "best.pt", "window_pos": (0, 0), "lane_id": 0},
+    {"name": "East_Lane", "ip": "10.148.188.86", "model_path": "best.pt", "window_pos": (640, 0), "lane_id": 1},
+    {"name": "South_Lane", "ip": "10.210.80.74", "model_path": "best.pt", "window_pos": (0, 480), "lane_id": 2},
+    {"name": "West_Lane", "ip": "10.210.80.144", "model_path": "best.pt", "window_pos": (640, 480), "lane_id": 3}
 ]
 
 # Serial Configuration
@@ -235,7 +235,7 @@ class OptimizedCameraDetector:
         self.model = model_manager.get_model(self.model_path)
 
         # Frame management with queues for better performance
-        self.frame_queue = Queue(maxsize=3)
+        self.frame_queue = Queue(maxsize=5)
         self.display_frame = None
         self.latest_frame = None
         self.lock = threading.Lock()
@@ -262,7 +262,7 @@ class OptimizedCameraDetector:
 
                     if frame is not None:
                         # Resize for faster processing
-                        frame = cv2.resize(frame, (640, 480))
+                        frame = cv2.resize(frame, (320, 240))
 
                         with self.lock:
                             self.latest_frame = frame.copy()
