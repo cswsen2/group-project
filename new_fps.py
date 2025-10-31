@@ -247,7 +247,7 @@ class OptimizedCameraDetector:
 
         # Optimized HTTP session
         self.session = requests.Session()
-        self.session.timeout = 1  # Reduced timeout
+        self.session.timeout = 3  # Reduced timeout
 
         print(f"[{self.name}] Initialized on {self.ip}")
 
@@ -274,7 +274,7 @@ class OptimizedCameraDetector:
             except Exception as e:
                 if "timeout" not in str(e).lower():
                     print(f"[{self.name}] Grab error: {e}")
-                time.sleep(0.1)
+                time.sleep(0.5)
 
     def frame_processor_thread(self):
         """Dedicated thread for AI processing"""
